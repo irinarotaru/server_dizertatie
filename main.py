@@ -11,97 +11,144 @@ import pickle
 
 app = FastAPI()
 
-PHOTO_DIR = "photos"
-os.makedirs(PHOTO_DIR, exist_ok=True)
-
 
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Camera Capture</title>
-    <style>
-        body { text-align: center; font-family: sans-serif; }
-        video { border: 2px solid black; border-radius: 8px; }
-        button { margin-top: 20px; padding: 10px 20px; font-size: 16px; cursor: pointer; }
-    </style>
-</head>
-<body>
-    <h2>Camera Capture</h2>
-    <p>Press the button to take a photo</p>
-
-    <video id="video" width="480" autoplay playsinline></video>
-    <br>
-    <button id="captureButton">Take Photo</button>
-
-    <canvas id="canvas" width="480" height="360" style="display:none;"></canvas>
-
-    <script>
-        const video = document.getElementById("video");
-        const canvas = document.getElementById("canvas");
-        const button = document.getElementById("captureButton");
-
-        async function startCamera() {
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-                video.srcObject = stream;
-            } catch (err) {
-                alert("Could not access camera: " + err);
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>FHE Face Capture</title>
+        <style>
+            body { text-align: center; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f4f9; }
+            .camera-container { 
+                position: relative; 
+                display: inline-block; 
+                margin-top: 20px;
+                border: 5px solid #333;
+                border-radius: 12px;
+                overflow: hidden;
             }
-        }
+            video { display: block; }
 
-        button.addEventListener("click", async () => {
-            // Ask user for photo name
-            let name = prompt("Please enter your name:");
+            /* Visual guide updated for 37:50 ratio (Portrait).
+               Using 74x100 for a tighter "zoom" so you can stand closer.
+            */
+            #overlay {
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                width: 111px;  
+                height: 150px; 
+                border: 3px dashed #00FF00;
+                box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.6); 
+                pointer-events: none;
+            }
+            button { 
+                margin-top: 20px; 
+                padding: 12px 24px; 
+                font-size: 18px; 
+                background: #28a745; 
+                color: white; 
+                border: none; 
+                border-radius: 5px; 
+                cursor: pointer; 
+            }
+            button:hover { background: #218838; }
+        </style>
+    </head>
+    <body>
+        <h2>Secure Face Enrollment</h2>
+        <p>Align your face within the green box (Stand Close)</p>
+
+        <div class="camera-container">
+            <video id="video" width="480" height="360" autoplay playsinline></video>
+            <div id="overlay"></div>
+        </div>
+        <br>
+        <button id="captureButton">Enroll Face</button>
+
+        <canvas id="canvas" width="37" height="50" style="display:none;"></canvas>
+
+        <script>
+            const video = document.getElementById("video");
+            const canvas = document.getElementById("canvas");
+            const button = document.getElementById("captureButton");
+
+            async function startCamera() {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                    video.srcObject = stream;
+                } catch (err) {
+                    alert("Camera access denied: " + err);
+                }
+            }
+
+            button.addEventListener("click", async () => {
+            // 1. IMMEDIATELY capture the frame from the video
+            const ctx = canvas.getContext("2d");
+            const cropW = 111; // Using the "Middle Ground" zoom for ease of use
+            const cropH = 150;
+            const sourceX = (video.videoWidth / 2) - (cropW / 2);
+            const sourceY = (video.videoHeight / 2) - (cropH / 2);
+        
+            ctx.drawImage(
+                video, 
+                sourceX, sourceY, cropW, cropH, 
+                0, 0, 37, 50
+            );
+        
+            // 2. Convert to data URL immediately so the "moment" is saved
+            const imageData = canvas.toDataURL("image/png");
+        
+            // 3. NOW ask for the name (the photo is already safely in memory)
+            let name = prompt("Photo captured! Now, enter your name to save:");
             if (!name) {
-                alert("Your name is required");
+                alert("Save cancelled. No name provided.");
                 return;
             }
-            name = name.trim();
-
-            // Draw video frame to canvas
-            const ctx = canvas.getContext("2d");
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-            const imageData = canvas.toDataURL("image/png");
-
+        
+            // 4. Send the captured data to the server
             try {
                 const response = await fetch("/photo", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ image: imageData, filename: name })
+                    body: JSON.stringify({ image: imageData, filename: name.trim() })
                 });
-
+        
                 const result = await response.json();
-                alert("Photo saved as: " + result.filename);
+                alert("Encrypted & Saved: " + result.filename);
             } catch (err) {
-                alert("Failed to save photo: " + err);
+                alert("Error saving photo: " + err);
             }
         });
-
+        
         startCamera();
-    </script>
-</body>
-</html>
-    """
+        </script>
+    </body>
+    </html>
+        """
 
-def encrypt_image_to_file(image_bytes, folder_path, filename):
+
+def run_full_encrypted_flow(image_bytes, filename, folder_path="secure_vault"):
+    # --- 1. SETUP & ENCRYPTION ---
     os.makedirs(folder_path, exist_ok=True)
+
     img = Image.open(io.BytesIO(image_bytes)).convert('L')
-    img_array = np.array(img, dtype=np.int64)
     width, height = img.size
-    flattened_pixels = img_array.flatten()
+    # Ensure memory is C-contiguous for Pyfhel/Cython
+    flattened_pixels = np.ascontiguousarray(np.array(img).flatten(), dtype=np.int64)
 
     HE = Pyfhel()
     HE.contextGen(scheme='bfv', n=8192, t=65537)
     HE.keyGen()
+    HE.relinKeyGen()
 
     n_slots = HE.n
-    all_ciphertexts_serialized = []
+    cipher_bytes_list = []
 
-    print(f"Encrypting...")
+    print(f"Encrypting {len(flattened_pixels)} pixels...")
     for i in range(0, len(flattened_pixels), n_slots):
         chunk = flattened_pixels[i: i + n_slots]
         if len(chunk) < n_slots:
@@ -109,60 +156,57 @@ def encrypt_image_to_file(image_bytes, folder_path, filename):
 
         ptxt = HE.encodeInt(chunk)
         ctxt = HE.encrypt(ptxt)
-        all_ciphertexts_serialized.append(ctxt.to_bytes())
+        cipher_bytes_list.append(ctxt.to_bytes())
 
-    test_ptxt = HE.decrypt(ctxt)  # Decrypt the last batch created
-    print(f"Verification - Last batch tail: {HE.decodeInt(test_ptxt)[-5:]}")
-
-    data_to_save = {
+    # Save everything to one file
+    save_data = {
         "context": HE.to_bytes_context(),
         "public_key": HE.to_bytes_public_key(),
         "secret_key": HE.to_bytes_secret_key(),
-        "ciphertexts": all_ciphertexts_serialized,
+        "relin_key": HE.to_bytes_relin_key(),
+        "ciphertexts": cipher_bytes_list,
         "metadata": {"width": width, "height": height}
     }
 
-    full_path = os.path.join(folder_path, filename)
+    full_path = os.path.join(folder_path, filename+".bin")
     with open(full_path, "wb") as f:
-        pickle.dump(data_to_save, f)
-    print(f"Encrypted file saved to {full_path}")
+        pickle.dump(save_data, f)
 
+    print(f"Step 1 Complete: Encrypted file saved to {full_path}")
 
-def decrypt_file_to_png(input_filepath, output_png_path):
-    with open(input_filepath, "rb") as f:
-        data = pickle.load(f)
+    # --- 2. LOADING & DECRYPTION ---
+    print(f"Step 2: Loading and Decrypting...")
+    with open(full_path, "rb") as f:
+        loaded_data = pickle.load(f)
 
-    HE = Pyfhel()
-    HE.from_bytes_context(data["context"])
-    HE.from_bytes_public_key(data["public_key"])
-    HE.from_bytes_secret_key(data["secret_key"])
+    # Re-setup HE from the loaded bytes
+    new_HE = Pyfhel()
+    new_HE.from_bytes_context(loaded_data["context"])
+    new_HE.from_bytes_public_key(loaded_data["public_key"])
+    new_HE.from_bytes_secret_key(loaded_data["secret_key"])
 
-    width, height = data["metadata"]["width"], data["metadata"]["height"]
-    decrypted_flattened = []
+    decrypted_pixels = []
+    for c_bytes in loaded_data["ciphertexts"]:
+        ctxt = PyCtxt(pyfhel=new_HE, bytestring=c_bytes)
 
-    print(f"Decrypting batches...")
-    for c_bytes in data["ciphertexts"]:
-        # 1. Load Ciphertext
-        ctxt = PyCtxt(pyfhel=HE, bytestring=c_bytes)
+        # The 'Strict Wrapper' Fix:
+        # Decrypt returns a raw array, we wrap it back into a ptxt to decode it
+        raw_array = new_HE.decrypt(ctxt)
+        tmp_ptxt = PyPtxt(pyfhel=new_HE)
+        new_HE.encodeInt(raw_array, tmp_ptxt)
 
-        # 2. Create an empty Plaintext object explicitly
-        ptxt = PyPtxt(pyfhel=HE)
+        decrypted_pixels.extend(new_HE.decodeInt(tmp_ptxt))
 
-        # 3. Decrypt INTO the ptxt object
-        HE.decrypt(ctxt, ptxt)
+    # --- 3. RECONSTRUCT PNG ---
+    w, h = loaded_data["metadata"]["width"], loaded_data["metadata"]["height"]
+    final_array = np.array(decrypted_pixels[:w * h], dtype=np.int64)
+    final_array = np.clip(final_array, 0, 255).astype(np.uint8)
+    final_img = Image.fromarray(final_array.reshape((h, w)))
 
-        # 4. Decode the ptxt object
-        decrypted_chunk = HE.decodeInt(ptxt)
-        decrypted_flattened.extend(decrypted_chunk)
-
-    # Reconstruct Image
-    total_pixels = width * height
-    final_pixels = np.array(decrypted_flattened[:total_pixels], dtype=np.int64)
-    final_pixels = np.clip(final_pixels, 0, 255).astype(np.uint8)
-    final_img_array = final_pixels.reshape((height, width))
-
-    Image.fromarray(final_img_array).save(output_png_path)
-    print(f"Success! Image restored to {output_png_path}")
+    os.makedirs("decrypted", exist_ok=True)
+    output_path = "decrypted/"+filename+".png"
+    final_img.save(output_path)
+    print(f"Step 3 Complete: Decrypted image saved to {output_path}")
 
 
 @app.post("/photo")
@@ -173,24 +217,9 @@ async def save_photo(request: Request):
 
     # Use the user-provided name
     filename = data["filename"].strip()
-    encrypt_image_to_file(image_bytes, "encrypted_data", filename+".bin")
-    #encrypt_to_single_file(image_bytes, "encrypted_data", filename+"1.bin")
-    decrypt_file_to_png(f"encrypted_data/{filename}.bin", "restored.png")
-
-"""
-    if not filename.endswith(".png"):
-        filename += ".png"
-
-    # Sanitize filename to avoid directory issues
-    filename = filename.replace("/", "_").replace("\\", "_")
-
-    filepath = os.path.join(PHOTO_DIR, filename)
-
-    with open(filepath, "wb") as f:
-        f.write(image_bytes)
+    run_full_encrypted_flow(image_bytes, filename=filename)
 
     return JSONResponse({"filename": filename})
-    """
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8000)
